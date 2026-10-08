@@ -1,0 +1,446 @@
+import re
+from urllib.parse import urljoin
+
+from playwright.sync_api import sync_playwright
+
+from crawler.database import save_products
+
+
+STORE_NAME = "Co.op Online"
+
+CATEGORY_URLS = [
+    # Rau, củ, nấm
+    "https://cooponline.vn/c/rau-cu",
+
+    # Trái cây
+    "https://cooponline.vn/c/rau-cu-trai-cay",
+
+    # Thịt
+    "https://cooponline.vn/c/thit",
+
+    # Hải sản
+    "https://cooponline.vn/c/hai-san",
+
+    # Thịt, trứng, hải sản
+    "https://cooponline.vn/c/thit-trung-hai-san",
+]
+
+
+# ---------------------------------------------------------
+# LẤY GIÁ TỪ TEXT
+# ---------------------------------------------------------
+
+def extract_prices(text):
+    """
+    Tìm các giá dạng:
+        54.000 ₫
+        112.000 ₫
+        35.000đ
+
+    Trả về danh sách số nguyên.
+    """
+
+    pattern = r"(?<!\d)(\d{1,3}(?:[.,]\d{3})+)\s*(?:₫|đ)"
+
+    prices = []
+
+    for match in re.findall(pattern, text, flags=re.IGNORECASE):
+        value = match.replace(".", "").replace(",", "")
+
+        try:
+            prices.append(int(value))
+        except ValueError:
+            pass
+
+    return prices
+
+
+# ---------------------------------------------------------
+# LẤY GIÁ GỐC
+# ---------------------------------------------------------
+
+def get_original_price(text):
+    """
+    Nếu sản phẩm giảm giá:
+
+        90.000 ₫ ... 112.000 ₫ -20%
+
+    thì lấy 112.000.
+
+    Nếu không giảm:
+
+        54.000 ₫
+
+    thì lấy 54.000.
+    """
+
+    prices = extract_prices(text)
+
+    if not prices:
+        return None
+
+    # Nếu có % giảm giá, giá cuối cùng thường là giá gốc
+    if re.search(r"-\s*\d+\s*%", text):
+        return prices[-1]
+
+    return prices[0]
+
+
+# ---------------------------------------------------------
+# LẤY TÊN SẢN PHẨM
+# ---------------------------------------------------------
+
+def clean_product_name(text):
+    lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Bỏ các dòng giao diện
+        if line.lower() in [
+            "thêm vào giỏ",
+            "sản phẩm tương tự",
+            "xem thêm sản phẩm",
+        ]:
+            continue
+
+        if re.fullmatch(r"[\d.,]+\s*(?:₫|đ)", line, re.IGNORECASE):
+            continue
+
+        if re.fullmatch(r"-\s*\d+%", line):
+            continue
+
+        lines.append(line)
+
+    # Thường tên sản phẩm nằm trong phần đầu của card.
+    # Nếu có nhiều dòng, lấy dòng đầu tiên có nội dung thực.
+    for line in lines:
+        if len(line) >= 3:
+            return line
+
+    return None
+
+
+# ---------------------------------------------------------
+# LẤY CARD CHỨA SẢN PHẨM
+# ---------------------------------------------------------
+
+def get_product_card(link):
+    """
+    Từ link sản phẩm, tìm phần tử cha chứa:
+        tên
+        giá
+        "Thêm vào giỏ"
+    """
+
+    card = link
+
+    for _ in range(8):
+        card = card.locator("..")
+
+        try:
+            text = card.inner_text(timeout=1000)
+
+            if "Thêm vào giỏ" in text:
+                return card
+
+        except Exception:
+            pass
+
+    return link.locator("..")
+
+
+# ---------------------------------------------------------
+# CRAWL 1 CATEGORY
+# ---------------------------------------------------------
+
+def crawl_category(page, category_url):
+
+    print()
+    print("=" * 70)
+    print("[CATEGORY]")
+    print(category_url)
+    print("=" * 70)
+
+    page.goto(
+        category_url,
+        wait_until="domcontentloaded",
+        timeout=60000
+    )
+
+    # Chờ website render sản phẩm
+    page.wait_for_timeout(4000)
+
+    # -----------------------------------------------------
+    # BẤM "XEM THÊM SẢN PHẨM"
+    # -----------------------------------------------------
+
+    previous_count = 0
+    no_change = 0
+
+    for _ in range(50):
+
+        product_links = page.locator(
+            "a[href*='--s']"
+        )
+
+        current_count = product_links.count()
+
+        print(
+            f"[LOAD] Đang có {current_count} product links"
+        )
+
+        if current_count == previous_count:
+            no_change += 1
+        else:
+            no_change = 0
+
+        if no_change >= 3:
+            break
+
+        previous_count = current_count
+
+        # Tìm nút "Xem thêm sản phẩm"
+        more_buttons = page.get_by_text(
+            "Xem thêm sản phẩm",
+            exact=True
+        )
+
+        if more_buttons.count() == 0:
+            break
+
+        clicked = False
+
+        for i in range(more_buttons.count()):
+            try:
+                button = more_buttons.nth(i)
+
+                if button.is_visible():
+                    button.scroll_into_view_if_needed()
+
+                    button.click(
+                        timeout=3000
+                    )
+
+                    page.wait_for_timeout(1500)
+
+                    clicked = True
+                    break
+
+            except Exception:
+                pass
+
+        if not clicked:
+            break
+
+    # -----------------------------------------------------
+    # LẤY SẢN PHẨM
+    # -----------------------------------------------------
+
+    product_links = page.locator(
+        "a[href*='--s']"
+    )
+
+    total_links = product_links.count()
+
+    print(f"[FOUND LINKS] {total_links}")
+
+    products = []
+    seen_urls = set()
+
+    for i in range(total_links):
+
+        link = product_links.nth(i)
+
+        try:
+            href = link.get_attribute("href")
+
+            if not href:
+                continue
+
+            url = urljoin(
+                "https://cooponline.vn",
+                href
+            )
+
+            # Chống trùng
+            if url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+
+            card = get_product_card(link)
+
+            text = card.inner_text(timeout=2000)
+
+            # Phải có giá
+            price = get_original_price(text)
+
+            if price is None:
+                continue
+
+            # -------------------------------------------------
+            # LẤY TÊN
+            # -------------------------------------------------
+
+            name = None
+
+            # Thử lấy title/aria-label trước
+            for attr in ["title", "aria-label"]:
+
+                try:
+                    value = link.get_attribute(attr)
+
+                    if value and len(value.strip()) >= 3:
+                        name = value.strip()
+                        break
+
+                except Exception:
+                    pass
+
+            # Nếu không có thì lấy từ text
+            if not name:
+                name = clean_product_name(text)
+
+            if not name:
+                continue
+
+            # Loại các link không phải sản phẩm
+            if len(name) < 3:
+                continue
+
+            product = {
+                "name": name,
+                "price": price,
+                "url": url
+            }
+
+            products.append(product)
+
+            print(
+                f"[PRODUCT] {name} | "
+                f"{price:,} VND"
+            )
+
+        except Exception:
+            continue
+
+    # -----------------------------------------------------
+    # LOẠI TRÙNG
+    # -----------------------------------------------------
+
+    unique = {}
+
+    for product in products:
+
+        key = product["url"]
+
+        if key not in unique:
+            unique[key] = product
+
+    products = list(unique.values())
+
+    print()
+    print(
+        f"[CATEGORY DONE] "
+        f"{len(products)} san pham"
+    )
+
+    return products
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+def main():
+
+    all_products = []
+
+    with sync_playwright() as p:
+
+        browser = p.chromium.launch(
+            headless=True
+        )
+
+        context = browser.new_context(
+            viewport={
+                "width": 1440,
+                "height": 900
+            },
+            locale="vi-VN"
+        )
+
+        page = context.new_page()
+
+        # User-Agent giống trình duyệt thật
+        page.set_extra_http_headers({
+            "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8"
+        })
+
+        for category_url in CATEGORY_URLS:
+
+            try:
+
+                products = crawl_category(
+                    page,
+                    category_url
+                )
+
+                all_products.extend(products)
+
+            except Exception as e:
+
+                print(
+                    f"[ERROR] {category_url}"
+                )
+
+                print(e)
+
+        browser.close()
+
+    # -----------------------------------------------------
+    # LOẠI TRÙNG TOÀN BỘ
+    # -----------------------------------------------------
+
+    unique = {}
+
+    for product in all_products:
+
+        key = product["url"]
+
+        if key not in unique:
+            unique[key] = product
+
+    all_products = list(unique.values())
+
+    print()
+    print("=" * 70)
+    print(
+        f"[TOTAL] {len(all_products)} san pham"
+    )
+    print("=" * 70)
+
+    # -----------------------------------------------------
+    # LƯU SUPABASE
+    # -----------------------------------------------------
+
+    if all_products:
+
+        save_products(
+            STORE_NAME,
+            all_products
+        )
+
+    else:
+
+        print(
+            "[DB] Khong co san pham de luu."
+        )
+
+
+if __name__ == "__main__":
+    main()
