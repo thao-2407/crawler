@@ -1,0 +1,36 @@
+name: Crawl gia thuc pham
+
+on:
+  schedule:
+    - cron: "0 22 * * *"   # 5 giờ sáng giờ Việt Nam
+    - cron: "0 10 * * *"   # 5 giờ chiều giờ Việt Nam
+  workflow_dispatch:        # cho phép bấm chạy tay
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4 playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: BHX
+        run: python bhx_crawler.py
+        continue-on-error: true
+      - name: Co.op Online
+        run: python cooponline_crawler.py
+        continue-on-error: true
+      - name: Winmart
+        run: python winmart_crawler.py
+        continue-on-error: true
+      - name: Chuan hoa don vi
+        run: python normalize_units.py
+        continue-on-error: true
