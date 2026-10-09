@@ -1,0 +1,55 @@
+name: Crawl gia thuc pham
+
+on:
+  schedule:
+    - cron: "17 22 * * *"   # 5:17 sáng giờ Việt Nam
+    - cron: "17 10 * * *"   # 5:17 chiều giờ Việt Nam
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4 playwright
+      - run: python -m playwright install --with-deps chromium
+
+      - name: Kiem tra ket noi
+        run: |
+          echo "Nuoc cua may chu: $(curl -s https://ipinfo.io/country)"
+          for u in https://www.bachhoaxanh.com https://winmart.vn https://cooponline.vn; do
+            echo "$u -> $(curl -s -o /dev/null -w '%{http_code}' -A 'Mozilla/5.0' $u)"
+          done
+        continue-on-error: true
+
+      - name: BHX
+        run: python bhx_crawler.py
+        continue-on-error: true
+      - name: Co.op Online
+        run: python cooponline_crawler.py
+        continue-on-error: true
+      - name: Winmart
+        run: python winmart_crawler.py
+        continue-on-error: true
+      - name: Chuan hoa don vi
+        run: python normalize_units.py
+        continue-on-error: true
+
+      - name: Luu file de kiem tra
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            *debug*.html
+            *.csv
+          if-no-files-found: ignore
