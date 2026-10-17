@@ -1,34 +1,45 @@
 # -*- coding: utf-8 -*-
 import os, re, csv, json
 import requests
-
+ 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
+ 
 # Winmart ghi đơn vị kiểu "0.5KG": True = đó là KHỐI LƯỢNG CỦA GÓI (giá cho 0.5kg),
 # False = giá đó đã là giá theo kg.
 WINMART_X_KG_IS_PACK = True
-
+ 
+# Trứng: nếu web không ghi vỉ hay hộp thì dùng chữ này
+DEFAULT_EGG_CONTAINER = "vỉ"
+ 
 # Xóa các sản phẩm không quy đổi được (unit_std/price_std trống)
 DELETE_UNRESOLVED = True
 # An toàn: nếu định xóa quá tỉ lệ này trên tổng số sản phẩm thì dừng, không xóa
 MAX_DELETE_RATIO = 0.4
-
+ 
+# Sản phẩm có tên chứa cụm nào trong danh sách này sẽ bị loại: xóa khỏi bảng
+# sau mỗi lần chạy (viết thường). Muốn loại thêm món nào thì thêm vào đây.
+EXCLUDE_NAMES = ["cà chua trứng"]
+ 
 NUM = r"(\d+(?:[.,]\d+)?)"
 UNIT = r"(kilogam|kg|ký|kí|gram|gam|gr|g)(?![^\W\d_])"
 W = re.compile(NUM + r"\s*" + UNIT, re.I)
 MULT_PRE = re.compile(r"(?<!\d)(\d{1,2})\s*[x×]\s*" + NUM + r"\s*" + UNIT, re.I)    # 3 x 100g
 MULT_POST = re.compile(NUM + r"\s*" + UNIT + r"\s*[x×]\s*(\d{1,2})(?!\d)", re.I)   # 100g x 3
-
+ 
 NOT_EGG = re.compile(
     r"bánh|\bmì\b|sữa|bột|sốt|chả|xúc xích|nước|giò|ruốc|cuộn|chiên|kem|snack|đậu|lẩu|"
-    r"bún|cháo|kẹo|socola|sô cô la|cá viên|nấu sẵn|ăn liền|tráng miệng|gia vị", re.I)
-
-CONTAINER = re.compile(r"\b(vỉ|hộp|khay|túi|bịch|lốc)\b", re.I)
-KEY_CONTAINER = re.compile(r"\b(vi|hop|khay|tui|bich|loc)\b")
-CONTAINER_VN = {"vi": "vỉ", "hop": "hộp", "khay": "khay",
-                "tui": "túi", "bich": "bịch", "loc": "lốc"}
-
-
+    r"bún|cháo|kẹo|socola|sô cô la|cá viên|nấu sẵn|ăn liền|tráng miệng|gia vị|"
+    r"cà chua trứng|cà trứng|trứng cá|cá trứng|trứng tôm|tôm trứng|có trứng", re.I)
+ 
+# Bao bì của trứng (gồm cả chữ "vĩ" hay bị gõ nhầm), quy về "vỉ" hoặc "hộp"
+CONTAINER = re.compile(r"\b(vỉ|vĩ|hộp|khay|lốc|túi|bịch)\b", re.I)
+KEY_CONTAINER = re.compile(r"\b(vi|hop|khay|loc|tui|bich)\b")
+KEY_CONTAINER_VN = {"vi": "vỉ", "hop": "hộp", "khay": "khay",
+                    "loc": "lốc", "tui": "túi", "bich": "bịch"}
+CONTAINER_STD = {"vỉ": "vỉ", "vĩ": "vỉ", "khay": "vỉ", "lốc": "vỉ",
+                 "hộp": "hộp", "túi": "hộp", "bịch": "hộp"}
+ 
+ 
 def load_config():
     url = os.environ.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -38,27 +49,27 @@ def load_config():
         url = url or d.get("url", "")
         key = key or d.get("key", "")
     return url.rstrip("/"), key
-
-
+ 
+ 
 def headers(key):
     h = {"apikey": key, "Content-Type": "application/json"}
     if not key.startswith("sb_"):
         h["Authorization"] = f"Bearer {key}"
     return h
-
-
+ 
+ 
 def to_kg(n, u):
     return n if u.lower() in ("kg", "kilogam", "ký", "kí") else n / 1000
-
-
+ 
+ 
 def key_text(key):
     """Biến product_key (dạng đường dẫn) thành chữ thường để đọc khối lượng."""
     k = (key or "").lower()
     k = re.sub(r"--[a-z]+\d+$", "", k)                                    # bỏ mã cuối
     k = re.sub(r"(?<!\d)(\d{1,2})-(\d)(kg)(?![a-z0-9])", r"\1.\2\3", k)  # 1-5kg -> 1.5kg
     return k.replace("-", " ").replace("_", " ")
-
-
+ 
+ 
 def weight_kg(text):
     """Khối lượng (kg) ghi trong chuỗi, hoặc None."""
     if not text:
@@ -76,16 +87,20 @@ def weight_kg(text):
                 return None
             kg = to_kg(float(m.group(1).replace(",", ".")), m.group(2))
     return kg if 0.005 <= kg <= 30 else None
-
-
+ 
+ 
+# Chỉ 3 loại trứng này mới được quy về "vỉ/hộp N quả"
+EGG_TYPE = re.compile(r"\btrứng\s+(gà|cút|vịt)\b", re.I)
+ 
+ 
 def is_egg(name):
     n = name.lower()
-    return bool(re.search(r"\btrứng\b", n)) and not NOT_EGG.search(n)
-
-
+    return bool(EGG_TYPE.search(n)) and not NOT_EGG.search(n)
+ 
+ 
 def egg_count(text, key=""):
     t = (text or "").lower()
-    for pat in (r"(\d+)\s*(?:quả|trái|trứng)", r"(?:vỉ|hộp|khay|túi|bịch|lốc)\s*(\d+)\b"):
+    for pat in (r"(\d+)\s*(?:quả|trái|trứng)", r"(?:vỉ|vĩ|hộp|khay|túi|bịch|lốc)\s*(\d+)\b"):
         m = re.search(pat, t)
         if m and 1 <= int(m.group(1)) <= 100:
             return int(m.group(1))
@@ -95,17 +110,22 @@ def egg_count(text, key=""):
         if m and 1 <= int(m.group(1)) <= 100:
             return int(m.group(1))
     return None
-
-
+ 
+ 
 def egg_container(name, unit, key):
+    """Trả về (từ gốc tìm được hoặc None, 'vỉ' hoặc 'hộp')."""
     for text in (unit, name):
         m = CONTAINER.search(text or "")
         if m:
-            return m.group(1).lower()
+            raw = m.group(1).lower()
+            return raw, CONTAINER_STD[raw]
     m = KEY_CONTAINER.search(key_text(key))
-    return CONTAINER_VN[m.group(1)] if m else None
-
-
+    if m:
+        raw = KEY_CONTAINER_VN[m.group(1)]
+        return raw, CONTAINER_STD[raw]
+    return None, DEFAULT_EGG_CONTAINER
+ 
+ 
 def normalize(r):
     price = r.get("list_price")
     if not price:
@@ -114,34 +134,38 @@ def normalize(r):
     unit = (r.get("unit") or "").strip()
     src = r.get("source") or ""
     pkey = r.get("product_key") or ""
-
+ 
+    if any(x in name.lower() for x in EXCLUDE_NAMES):
+        return None
+ 
     if is_egg(name):
         n = egg_count(f"{name} {unit}", pkey)
         if not n:
             return None
-        box = egg_container(name, unit, pkey)
-        label = f"{box} {n} quả" if box else f"{n} quả"
-        return (label, round(price), f"giá nguyên {box or 'gói'}, {n} quả")
-
+        raw, box = egg_container(name, unit, pkey)
+        note = (f"giá nguyên {raw}, {n} quả" if raw
+                else f"giá nguyên gói, {n} quả (web không ghi vỉ/hộp, dùng mặc định)")
+        return (f"{box} {n} quả", round(price), note)
+ 
     if re.fullmatch(r"kg\.?", unit, re.I):
         return ("kg", round(price), "web ghi giá theo kg")
-
+ 
     kg = weight_kg(unit)
     if kg:
         if src == "winmart" and not WINMART_X_KG_IS_PACK:
             return ("kg", round(price), "winmart: giá theo kg")
         return ("kg", round(price / kg), "khối lượng ghi ở đơn vị")
-
+ 
     kg = weight_kg(name)
     if kg:
         return ("kg", round(price / kg), "khối lượng ghi trong tên")
-
+ 
     kg = weight_kg(key_text(pkey))
     if kg:
         return ("kg", round(price / kg), "khối lượng ghi trong product_key")
     return None
-
-
+ 
+ 
 def delete_keys(url, key, table, rows):
     """Xóa các dòng theo (source, product_key). Trả về số dòng đã xóa, hoặc None nếu lỗi."""
     by_src = {}
@@ -165,8 +189,8 @@ def delete_keys(url, key, table, rows):
             except Exception:
                 pass
     return total
-
-
+ 
+ 
 def main():
     url, key = load_config()
     if not url or not key:
@@ -187,7 +211,7 @@ def main():
             break
         offset += 1000
     print(f"Đọc được {len(rows)} sản phẩm.")
-
+ 
     payload, unresolved, basis = [], [], {}
     n_kg = n_egg = 0
     for r in rows:
@@ -205,7 +229,7 @@ def main():
         else:
             unresolved.append(r)
         payload.append(item)
-
+ 
     ok = True
     for i in range(0, len(payload), 100):
         resp = requests.post(
@@ -216,26 +240,28 @@ def main():
             print("Lỗi Supabase:", resp.status_code, resp.text[:400])
             ok = False
             break
-
+ 
     print(f"Đã quy về kg: {n_kg} | trứng (giá cả vỉ/hộp): {n_egg}")
     for k, v in basis.items():
         print(f"   - {k}: {v}")
     print(f"Không quy đổi được: {len(unresolved)} sản phẩm "
           "(đơn vị, tên và product_key đều không ghi khối lượng/số quả)")
-
+ 
     if unresolved:
         with open("da_xoa_khong_quy_doi_duoc.csv", "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=["source", "category", "name", "unit", "list_price", "product_key"],
-                               extrasaction="ignore")
+            w = csv.DictWriter(
+                f, fieldnames=["source", "category", "name", "unit", "list_price", "product_key"],
+                extrasaction="ignore")
             w.writeheader()
             w.writerows(unresolved)
         for r in unresolved[:15]:
             print(f"  - [{r['source']}] {r['name']} ({r.get('unit') or '-'}) - {r['list_price']}")
-
+ 
         if ok and DELETE_UNRESOLVED:
             if len(unresolved) > MAX_DELETE_RATIO * len(rows):
                 print(f"(!) Định xóa {len(unresolved)}/{len(rows)} sản phẩm, vượt mức an toàn "
-                      f"{int(MAX_DELETE_RATIO * 100)}%. KHÔNG xóa gì. Hãy gửi danh sách mẫu ở trên cho mình xem.")
+                      f"{int(MAX_DELETE_RATIO * 100)}%. KHÔNG xóa gì. "
+                      "Hãy gửi danh sách mẫu ở trên cho mình xem.")
             else:
                 d1 = delete_keys(url, key, "price_history", unresolved)
                 d2 = delete_keys(url, key, "food_products", unresolved)
@@ -247,7 +273,7 @@ def main():
                 else:
                     print(f"Đã xóa {d2} sản phẩm không quy đổi được (cùng lịch sử giá của chúng).")
     print("Đã cập nhật Supabase." if ok else "Cập nhật Supabase có lỗi.")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
